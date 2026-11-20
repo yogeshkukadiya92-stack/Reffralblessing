@@ -1,0 +1,18 @@
+services:
+  circle:
+    build: .
+    restart: unless-stopped
+    environment:
+      CIRCLE_PUBLIC_URL: ${SERVICE_URL_CIRCLE:?Set the HTTPS domain for Circle}
+      CIRCLE_ADMIN_PASSWORD: ${SERVICE_PASSWORD_64_ADMIN:?Generate a private admin password}
+    expose:
+      - "4174"
+    volumes:
+      - circle-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4174/api/points', timeout=3).read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+volumes:
+  circle-data:
