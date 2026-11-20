@@ -31,6 +31,13 @@ with closing(database()) as db, db:
         phone TEXT NOT NULL, referred INTEGER NOT NULL, points INTEGER NOT NULL,
         verified INTEGER NOT NULL DEFAULT 0, UNIQUE(workshop, phone))''')
 
+REWARDS = {'Learning Toolkit': 50, 'VIP Workshop Pass': 150, 'Community Mentor Session': 250}
+with closing(database()) as db, db:
+    db.execute("""CREATE TABLE IF NOT EXISTS claims (
+        id INTEGER PRIMARY KEY, reward TEXT NOT NULL, points INTEGER NOT NULL,
+        date TEXT DEFAULT CURRENT_DATE, status TEXT DEFAULT 'Pending approval',
+        nonce TEXT NOT NULL UNIQUE)""")
+
 class App(BaseHTTPRequestHandler):
     def send(self, body, status=200, mime='text/html; charset=utf-8'):
         payload = body.encode()
@@ -84,11 +91,28 @@ class App(BaseHTTPRequestHandler):
         elif url.path == '/admin' and self.authorized():
             with closing(database()) as db:
                 rows = db.execute('SELECT id, workshop, name, verified FROM registrations ORDER BY id DESC').fetchall()
-            self.page('Verify registrations', ''.join(
+                claims = db.execute("SELECT id,reward FROM claims WHERE status='Pending approval'").fetchall()
+            actions = ''.join(f'<section>{html.escape(reward)}<form method="post" action="/admin"><input type="hidden" name="claim" value="{cid}"><button>Approve reward</button></form></section>' for cid,reward in claims)
+            self.page('Verify registrations', actions + ''.join(
                 f'<section><strong>{html.escape(name)}</strong><p>{WORKSHOPS[slug][0]}</p>'
                 + ('<small>Verified</small>' if verified else
                    f'<form method="post" action="/admin"><input type="hidden" name="id" value="{rid}"><button>Verify registration</button></form>')
                 + '</section>' for rid, slug, name, verified in rows) or '<p>No registrations yet.</p>')
+        elif url.path == '/claims':
+            with closing(database()) as db:
+                db.row_factory = sqlite3.Row
+                claims = db.execute('SELECT reward AS name, points, date, status FROM claims ORDER BY id DESC').fetchall()
+            self.send(json.dumps([dict(row) for row in claims]), mime='application/json')
+        elif url.path == '/redeem':
+            if not self.authorized():
+                return
+            reward = query.get('reward', [''])[0]
+            if reward not in REWARDS:
+                return self.page('Unknown reward', '', 404)
+            self.page('Confirm reward request', f"""<section><p>{reward} · {REWARDS[reward]} Blessing Points</p>
+                <form method="post"><input type="hidden" name="reward" value="{reward}">
+                <input type="hidden" name="nonce" value="{secrets.token_hex(16)}">
+                <button>Reserve points and submit request</button></form></section>""")
         elif url.path == '/api/activity':
             with closing(database()) as db:
                 rows = db.execute('SELECT workshop, points, verified FROM registrations WHERE referred=1 ORDER BY id DESC').fetchall()
@@ -117,10 +141,27 @@ class App(BaseHTTPRequestHandler):
         fields = parse_qs(self.rfile.read(int(size)).decode(errors='replace'))
         def field(key):
             return fields.get(key, [''])[0].strip()
+        if urlsplit(self.path).path == '/redeem':
+            if not self.authorized():
+                return
+            reward, nonce = field('reward'), field('nonce')
+            if reward not in REWARDS or not re.fullmatch('[a-f0-9]{32}', nonce):
+                return self.page('Invalid request', '', 400)
+            with closing(database()) as db, db:
+                db.execute('BEGIN IMMEDIATE')
+                earned = db.execute('SELECT COALESCE(SUM(points),0) FROM registrations WHERE referred=1 AND verified=1').fetchone()[0]
+                reserved = db.execute('SELECT COALESCE(SUM(points),0) FROM claims').fetchone()[0]
+                if not db.execute('SELECT 1 FROM claims WHERE nonce=?',(nonce,)).fetchone():
+                    if earned-reserved < REWARDS[reward]:
+                        return self.page('Insufficient Blessing Points', '<p>Your balance has changed.</p>', 409)
+                    db.execute('INSERT INTO claims(reward,points,nonce) VALUES(?,?,?)',(reward,REWARDS[reward],nonce))
+            return self.page('Reward requested', '<p>Your Blessing Points have been reserved.</p>')
         if self.path == '/admin':
             if not self.authorized():
                 return
             with closing(database()) as db, db:
+                if field('claim'):
+                    db.execute("UPDATE claims SET status='Approved' WHERE id=? AND status='Pending approval'", (field('claim'),))
                 db.execute('UPDATE registrations SET verified=1 WHERE id=? AND verified=0', (field('id'),))
             self.send_response(303)
             self.send_header('Location', '/admin')
