@@ -3,7 +3,7 @@ services:
     build: .
     restart: unless-stopped
     environment:
-      CIRCLE_PUBLIC_URL: ${SERVICE_URL_CIRCLE:?Set the HTTPS domain for Circle}
+      CIRCLE_PUBLIC_URL: ${CIRCLE_ORIGIN:-https://circle-s7fpkqeck7wac2zt4vj6czpd.13.140.130.27.sslip.io}
       CIRCLE_ADMIN_PASSWORD: ${SERVICE_PASSWORD_64_ADMIN:?Generate a private admin password}
     expose:
       - "4174"
