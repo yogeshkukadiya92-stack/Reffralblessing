@@ -1,3 +1,4 @@
+import hashlib
 import hmac
 import html
 import json
@@ -6,6 +7,7 @@ import re
 import secrets
 import sqlite3
 from contextlib import closing
+from http.cookies import SimpleCookie, CookieError
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -18,175 +20,429 @@ if HOST != '127.0.0.1' and (not ADMIN or not PUBLIC_URL.startswith('https://')):
     raise SystemExit('Hosted mode requires CIRCLE_ADMIN_PASSWORD and an HTTPS CIRCLE_PUBLIC_URL.')
 ADMIN = ADMIN or secrets.token_urlsafe(18)
 DB_PATH = os.environ.get('CIRCLE_DB_PATH', str(ROOT / 'circle.sqlite3'))
-CODE = 'YOGESH24'
+LEGACY_CODE = 'YOGESH24'
+SESSION_SECONDS = 7 * 24 * 60 * 60
 WORKSHOPS = {'personality-awareness': ('Personality Awareness', 10),
              'mindful-communication': ('Mindful Communication', 20)}
+REWARDS = {'Learning Toolkit': 50, 'VIP Workshop Pass': 150, 'Community Mentor Session': 250}
+escape = html.escape
+
 
 def database():
-    return sqlite3.connect(DB_PATH)
+    db = sqlite3.connect(DB_PATH, timeout=10)
+    db.row_factory = sqlite3.Row
+    db.execute('PRAGMA foreign_keys=ON')
+    return db
+
 
 with closing(database()) as db, db:
-    db.execute('''CREATE TABLE IF NOT EXISTS registrations (
-        id INTEGER PRIMARY KEY, workshop TEXT NOT NULL, name TEXT NOT NULL,
-        phone TEXT NOT NULL, referred INTEGER NOT NULL, points INTEGER NOT NULL,
-        verified INTEGER NOT NULL DEFAULT 0, UNIQUE(workshop, phone))''')
+    db.executescript('''
+        CREATE TABLE IF NOT EXISTS registrations (
+            id INTEGER PRIMARY KEY, workshop TEXT NOT NULL, name TEXT NOT NULL,
+            phone TEXT NOT NULL, referred INTEGER NOT NULL, points INTEGER NOT NULL,
+            verified INTEGER NOT NULL DEFAULT 0, UNIQUE(workshop, phone));
+        CREATE TABLE IF NOT EXISTS claims (
+            id INTEGER PRIMARY KEY, reward TEXT NOT NULL, points INTEGER NOT NULL,
+            date TEXT DEFAULT CURRENT_DATE, status TEXT DEFAULT 'Pending approval',
+            nonce TEXT NOT NULL UNIQUE);
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
+            salt TEXT NOT NULL, password_hash TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS links (
+            code TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id),
+            workshop TEXT NOT NULL DEFAULT '', recipient TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            share_actions INTEGER NOT NULL DEFAULT 0, opens INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS sessions (
+            token_hash TEXT PRIMARY KEY, user_id INTEGER REFERENCES users(id),
+            is_admin INTEGER NOT NULL DEFAULT 0, expires INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS login_attempts (
+            client TEXT PRIMARY KEY, attempts INTEGER NOT NULL, expires INTEGER NOT NULL);
+    ''')
+    db.execute('BEGIN IMMEDIATE')
+    for table, column, definition in (
+        ('registrations', 'link_code', 'TEXT REFERENCES links(code)'),
+        ('registrations', 'created_at', 'TEXT'),
+        ('claims', 'user_id', 'INTEGER REFERENCES users(id)'),
+    ):
+        if column not in {row['name'] for row in db.execute(f'PRAGMA table_info({table})')}:
+            db.execute(f'ALTER TABLE {table} ADD COLUMN {column} {definition}')
+    db.execute('CREATE INDEX IF NOT EXISTS registrations_by_link ON registrations(link_code)')
+    db.execute('CREATE INDEX IF NOT EXISTS links_by_owner ON links(user_id)')
+    db.execute('CREATE INDEX IF NOT EXISTS claims_by_owner ON claims(user_id)')
 
-REWARDS = {'Learning Toolkit': 50, 'VIP Workshop Pass': 150, 'Community Mentor Session': 250}
-with closing(database()) as db, db:
-    db.execute("""CREATE TABLE IF NOT EXISTS claims (
-        id INTEGER PRIMARY KEY, reward TEXT NOT NULL, points INTEGER NOT NULL,
-        date TEXT DEFAULT CURRENT_DATE, status TEXT DEFAULT 'Pending approval',
-        nonce TEXT NOT NULL UNIQUE)""")
+
+def hash_password(password, salt):
+    return hashlib.scrypt(password.encode(), salt=bytes.fromhex(salt), n=32768, r=8, p=1,
+                          maxmem=64 * 1024 * 1024).hex()
+
+
+def workshop_name(slug):
+    return WORKSHOPS.get(slug, (slug, 0))[0]
+
+
+def totals(db, user_id):
+    earned = db.execute('''SELECT COALESCE(SUM(r.points), 0) FROM registrations r
+                           JOIN links l ON l.code=r.link_code WHERE l.user_id=? AND r.verified=1''',
+                        (user_id,)).fetchone()[0]
+    reserved = db.execute('SELECT COALESCE(SUM(points),0) FROM claims WHERE user_id=?',
+                          (user_id,)).fetchone()[0]
+    return earned, reserved
+
+
+def table(headers, rows):
+    columns = ''.join(f'<th scope="col">{escape(header)}</th>' for header in headers)
+    body = ''.join('<tr>' + ''.join(f'<td>{cell}</td>' for cell in row) + '</tr>' for row in rows)
+    return f'<div class="table"><table><thead><tr>{columns}</tr></thead><tbody>{body}</tbody></table></div>'
+
 
 class App(BaseHTTPRequestHandler):
-    def send(self, body, status=200, mime='text/html; charset=utf-8'):
+    def send(self, body, status=200, mime='text/html; charset=utf-8', headers=()):
         payload = body.encode()
         self.send_response(status)
+        for key, value in headers:
+            self.send_header(key, value)
         self.send_header('Content-Type', mime)
         self.send_header('Content-Length', str(len(payload)))
         self.send_header('Cache-Control', 'no-store')
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('Referrer-Policy', 'same-origin')
         self.end_headers()
         self.wfile.write(payload)
+
+    def json(self, body, status=200):
+        return self.send(json.dumps(body), status, 'application/json')
+
+    def redirect(self, location, cookie=None):
+        headers = [('Location', location)]
+        if cookie is not None:
+            headers.append(('Set-Cookie', cookie))
+        return self.send('', 303, headers=headers)
 
     def page(self, title, body, status=200):
         self.send(f'''<!doctype html><html lang="en"><meta charset="utf-8">
         <meta name="viewport" content="width=device-width,initial-scale=1">
-        <title>{title} · Circle</title><style>
+        <title>{escape(title)} · Circle</title><style>
         *{{box-sizing:border-box}}body{{margin:0;background:#f6f8f7;color:#173e33;font:16px system-ui}}
-        main{{max-width:700px;margin:7vh auto;padding:24px}}section{{background:white;padding:24px;border-radius:14px;margin:18px 0}}
-        h1{{font-size:36px;letter-spacing:-1px}}label{{display:block;margin:14px 0}}
-        input{{display:block;width:100%;padding:12px;border:1px solid #d3ded7;border-radius:8px;margin-top:6px}}
+        main{{max-width:1140px;margin:5vh auto;padding:24px}}section{{background:white;padding:24px;border-radius:14px;margin:18px 0}}
+        h1{{font-size:36px;letter-spacing:-1px}}label{{display:block;margin:14px 0}}form{{max-width:480px}}
+        input{{display:block;width:100%;padding:12px;border:1px solid #a9bab1;border-radius:8px;margin-top:6px}}
         button{{background:#ef9866;color:#173e33;border:0;border-radius:8px;padding:12px 18px;font:inherit;cursor:pointer}}
-        a{{color:#173e33}}small{{color:#526b60}}</style>
-        <main><a href="/">Circle · Dashboard</a><h1>{title}</h1>{body}</main></html>''', status)
+        a{{color:#173e33}}small{{color:#526b60}}.table{{overflow:auto}}table{{width:100%;border-collapse:collapse}}
+        th,td{{text-align:left;padding:10px;border-bottom:1px solid #dde7e0;white-space:nowrap}}
+        .links{{display:flex;gap:18px;align-items:center;flex-wrap:wrap}}.links form{{margin:0}}</style>
+        <main><a href="/">Circle</a><h1>{escape(title)}</h1>{body}</main></html>''', status)
 
-    def authorized(self):
-        import base64
-        expected = 'Basic ' + base64.b64encode(('admin:' + ADMIN).encode()).decode()
-        if hmac.compare_digest(self.headers.get('Authorization', '').encode(), expected.encode()):
-            return True
-        self.send_response(401)
-        self.send_header('WWW-Authenticate', 'Basic realm="Circle local admin"')
-        self.end_headers()
-        return False
+    def cookie(self, value, lifetime):
+        secure = '; Secure' if PUBLIC_URL else ''
+        return f'circle_session={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={lifetime}{secure}'
+
+    def token_hash(self):
+        cookies = SimpleCookie()
+        try:
+            cookies.load(self.headers.get('Cookie', ''))
+        except CookieError:
+            return ''
+        token = cookies.get('circle_session')
+        return hashlib.sha256(token.value.encode()).hexdigest() if token else ''
+
+    def session(self):
+        with closing(database()) as db:
+            return db.execute("""SELECT s.user_id,s.is_admin,u.name,u.username FROM sessions s
+                 LEFT JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.expires>unixepoch()""",
+                              (self.token_hash(),)).fetchone()
+
+    def start_session(self, user_id=None, is_admin=False):
+        token = secrets.token_urlsafe(32)
+        with closing(database()) as db, db:
+            db.execute('DELETE FROM sessions WHERE token_hash=? OR expires<=unixepoch()', (self.token_hash(),))
+            db.execute('INSERT INTO sessions VALUES(?,?,?,unixepoch()+?)',
+                       (hashlib.sha256(token.encode()).hexdigest(), user_id, int(is_admin), SESSION_SECONDS))
+        return self.redirect('/admin' if is_admin else '/', self.cookie(token, SESSION_SECONDS))
+
+    def auth_page(self, path, error='', status=200):
+        signup = path == '/signup'
+        admin = path == '/admin/login'
+        title = 'Admin login' if admin else 'Create your account' if signup else 'Member login'
+        notice = f'<p role="alert">{escape(error)}</p>' if error else ''
+        name = '<label>Full name<input name="name" required maxlength="80" autocomplete="name"></label>' if signup else ''
+        username = ('<label>Username<input name="username" required minlength="3" maxlength="40" '
+                    'autocomplete="username"></label>') if not admin else ''
+        minimum = 'minlength="12"' if signup else ''
+        autocomplete = 'new-password' if signup else 'current-password'
+        links = ('<a href="/login">Member login</a>' if admin else
+                 '<a href="/login">Already have an account? Log in</a>' if signup else
+                 '<a href="/signup">Create account</a> · <a href="/admin/login">Admin login</a>')
+        self.page(title, f'''<section>{notice}<form method="post" action="{path}">{name}{username}
+        <label>Password<input name="password" type="password" required maxlength="256" {minimum}
+        autocomplete="{autocomplete}"></label><button>{title}</button></form><p>{links}</p></section>''', status)
+
+    def referral(self, code, slug='', count=False):
+        if code == LEGACY_CODE:
+            return code
+        if not re.fullmatch(r'[A-Za-z0-9_-]{16}', code):
+            return ''
+        with closing(database()) as db, db:
+            if count:
+                cursor = db.execute("UPDATE links SET opens=opens+1 WHERE code=? AND workshop IN ('',?)",
+                                    (code, slug))
+                return code if cursor.rowcount else ''
+            return code if db.execute("SELECT 1 FROM links WHERE code=? AND workshop IN ('',?)",
+                                      (code, slug)).fetchone() else ''
+
+    def admin_page(self):
+        with closing(database()) as db:
+            users = db.execute('''SELECT u.username,u.name,COUNT(l.code) AS links,
+                COALESCE(SUM(l.share_actions),0) AS shares,COALESCE(SUM(l.opens),0) AS opens,
+                COALESCE(SUM(r.registrations),0) AS registrations,COALESCE(SUM(r.earned),0) AS earned,
+                COALESCE(c.reserved,0) AS reserved
+                FROM users u LEFT JOIN links l ON l.user_id=u.id
+                LEFT JOIN (SELECT link_code,COUNT(*) AS registrations,SUM(points*verified) AS earned
+                           FROM registrations GROUP BY link_code) r ON r.link_code=l.code
+                LEFT JOIN (SELECT user_id,SUM(points) AS reserved FROM claims GROUP BY user_id) c ON c.user_id=u.id
+                GROUP BY u.id ORDER BY u.username''').fetchall()
+            links = db.execute('''SELECT l.*,u.username,COUNT(r.id) AS registrations,
+                COALESCE(SUM(r.verified),0) AS confirmed,COALESCE(SUM(r.points*r.verified),0) AS earned
+                FROM links l JOIN users u ON u.id=l.user_id LEFT JOIN registrations r ON r.link_code=l.code
+                GROUP BY l.code ORDER BY l.created_at DESC''').fetchall()
+            registrations = db.execute('''SELECT r.*,u.username,l.recipient FROM registrations r
+                LEFT JOIN links l ON l.code=r.link_code LEFT JOIN users u ON u.id=l.user_id
+                ORDER BY r.id DESC''').fetchall()
+            claims = db.execute('''SELECT c.*,u.username FROM claims c LEFT JOIN users u ON u.id=c.user_id
+                ORDER BY c.id DESC''').fetchall()
+
+        def cells(*values):
+            return tuple(escape(str(value)) for value in values)
+
+        def action(field, value, label):
+            return f'<form method="post" action="/admin"><input type="hidden" name="{field}" value="{value}"><button>{label}</button></form>'
+
+        members = table(('Username', 'Member', 'Links', 'Share actions', 'Opens', 'Registrations', 'Earned', 'Available'),
+                        (cells(r['username'], r['name'], r['links'], r['shares'], r['opens'], r['registrations'],
+                               r['earned'], r['earned'] - r['reserved']) for r in users))
+        shares = table(('Owner', 'Recipient label', 'Link code', 'Workshop', 'Share actions', 'Opens', 'Registrations', 'Verified', 'Earned'),
+                       (cells(r['username'], r['recipient'] or '—', r['code'], workshop_name(r['workshop']) or 'All',
+                              r['share_actions'], r['opens'], r['registrations'], r['confirmed'], r['earned']) for r in links))
+        records = table(('Participant', 'Mobile', 'Workshop', 'Registered at (UTC)', 'Referred by', 'Recipient label', 'Link code', 'Status', 'Points earned', 'Action'),
+                        (cells(r['name'], r['phone'], workshop_name(r['workshop']), r['created_at'] or '—',
+                               r['username'] or ('Legacy referral' if r['referred'] else 'Direct'),
+                               r['recipient'] or '—', r['link_code'] or ('YOGESH24' if r['referred'] else '—'),
+                               'Verified' if r['verified'] else 'Pending',
+                               r['points'] if r['verified'] and r['referred'] else 0) +
+                         ('—' if r['verified'] else action('id', r['id'], 'Verify'),) for r in registrations))
+        rewards = table(('Member', 'Reward', 'Points', 'Date', 'Status', 'Action'),
+                        (cells(r['username'] or 'Legacy', r['reward'], r['points'], r['date'], r['status']) +
+                         ((action('claim', r['id'], 'Approve') if r['status'] == 'Pending approval' else '—'),)
+                         for r in claims))
+        self.page('Referral admin', f'''<div class="links"><a href="#members">Members</a><a href="#shares">Referral links</a>
+            <a href="#registrations">Registrations</a><a href="#rewards">Rewards</a>
+            <form method="post" action="/logout"><input type="hidden" name="logout" value="1"><button>Log out</button></form></div>
+            <section id="members"><h2>Members · {len(users)}</h2>{members}</section>
+            <section id="shares"><h2>Referral links · {len(links)}</h2>
+            <p>Recipient labels are entered by members. Share actions count copy and WhatsApp clicks.
+            Opens count workshop or invitation page visits and may include repeat visits.</p>{shares}</section>
+            <section id="registrations"><h2>Registrations · {len(registrations)}</h2>{records}</section>
+            <section id="rewards"><h2>Reward requests · {len(claims)}</h2>{rewards}</section>''')
 
     def do_GET(self):
         url = urlsplit(self.path)
+        path = url.path
         query = parse_qs(url.query)
-        ref = query.get('ref', [''])[0] == CODE
-        if url.path == '/' and ref:
-            self.page('Explore workshops', ''.join(
-                f'<section><a href="/w/{slug}?ref={CODE}">{name}</a></section>'
+        code = query.get('ref', [''])[0]
+        if path == '/api/points' and not self.session():
+            return self.json({'status': 'ok'})
+        if path in ('/login', '/signup', '/admin/login'):
+            return self.auth_page(path)
+        if path == '/' and code:
+            if not self.referral(code, count=True):
+                return self.page('Referral link unavailable', '', 404)
+            return self.page('Explore workshops', ''.join(
+                f'<section><a href="/w/{slug}?ref={code}&amp;from=invite">{name}</a></section>'
                 for slug, (name, _) in WORKSHOPS.items()))
-        elif url.path == '/':
-            self.send((ROOT / 'index.html').read_text())
-        elif url.path.startswith('/w/') and (slug := url.path[3:]) in WORKSHOPS:
-            name, _ = WORKSHOPS[slug]
-            self.page(name, f'''<section><p>Reserve your place in this workshop.</p>
-            <form method="post" action="/w/{slug}">
-            <input type="hidden" name="ref" value="{CODE if ref else ''}">
+        if path.startswith('/w/') and (slug := path[3:]) in WORKSHOPS:
+            if code and not self.referral(code, slug, count=query.get('from') != ['invite']):
+                return self.page('Referral link unavailable', '', 404)
+            name = workshop_name(slug)
+            return self.page(name, f'''<section><p>Reserve your place in this workshop.</p>
+            <form method="post" action="/w/{slug}"><input type="hidden" name="ref" value="{code}">
             <label>Full name<input name="name" required maxlength="80" autocomplete="name"></label>
             <label>Mobile with country code<input name="phone" required type="tel" autocomplete="tel" placeholder="+91…"></label>
             <button>Register</button></form></section>''')
-        elif url.path == '/admin' and self.authorized():
-            with closing(database()) as db:
-                rows = db.execute('SELECT id, workshop, name, verified FROM registrations ORDER BY id DESC').fetchall()
-                claims = db.execute("SELECT id,reward FROM claims WHERE status='Pending approval'").fetchall()
-            actions = ''.join(f'<section>{html.escape(reward)}<form method="post" action="/admin"><input type="hidden" name="claim" value="{cid}"><button>Approve reward</button></form></section>' for cid,reward in claims)
-            self.page('Verify registrations', actions + ''.join(
-                f'<section><strong>{html.escape(name)}</strong><p>{WORKSHOPS[slug][0]}</p>'
-                + ('<small>Verified</small>' if verified else
-                   f'<form method="post" action="/admin"><input type="hidden" name="id" value="{rid}"><button>Verify registration</button></form>')
-                + '</section>' for rid, slug, name, verified in rows) or '<p>No registrations yet.</p>')
-        elif url.path == '/claims':
-            with closing(database()) as db:
-                db.row_factory = sqlite3.Row
-                claims = db.execute('SELECT reward AS name, points, date, status FROM claims ORDER BY id DESC').fetchall()
-            self.send(json.dumps([dict(row) for row in claims]), mime='application/json')
-        elif url.path == '/redeem':
-            if not self.authorized():
-                return
+        session = self.session()
+        if path == '/admin':
+            return self.admin_page() if session and session['is_admin'] else self.redirect('/admin/login')
+        if path not in ('/', '/api/activity', '/api/points', '/claims', '/redeem'):
+            return self.page('Page unavailable', '', 404)
+        if session and session['is_admin'] and path == '/':
+            return self.redirect('/admin')
+        if not session or not session['user_id']:
+            return self.json({'error': 'Member login required'}, 401) if path.startswith('/api/') or path == '/claims' else self.redirect('/login')
+        user_id = session['user_id']
+        if path == '/':
+            return self.send((ROOT / 'index.html').read_text())
+        if path == '/redeem':
             reward = query.get('reward', [''])[0]
             if reward not in REWARDS:
                 return self.page('Unknown reward', '', 404)
-            self.page('Confirm reward request', f"""<section><p>{reward} · {REWARDS[reward]} Blessing Points</p>
+            return self.page('Confirm reward request', f'''<section><p>{reward} · {REWARDS[reward]} Blessing Points</p>
                 <form method="post"><input type="hidden" name="reward" value="{reward}">
                 <input type="hidden" name="nonce" value="{secrets.token_hex(16)}">
-                <button>Reserve points and submit request</button></form></section>""")
-        elif url.path == '/api/activity':
-            with closing(database()) as db:
-                rows = db.execute('SELECT workshop, points, verified FROM registrations WHERE referred=1 ORDER BY id DESC').fetchall()
-            records = [
-                {'workshop': WORKSHOPS[slug][0], 'points': points, 'verified': bool(verified)}
-                for slug, points, verified in rows
-            ]
-            self.send(json.dumps(records), mime='application/json')
-        elif url.path == '/api/points':
-            with closing(database()) as db:
-                points, count, pending = db.execute(
-                    'SELECT COALESCE(SUM(points*verified),0), COALESCE(SUM(verified),0), COUNT(*)-COALESCE(SUM(verified),0) FROM registrations WHERE referred=1').fetchone()
-            self.send(f'{{"points":{points},"confirmed":{count},"pending":{pending}}}', mime='application/json')
-        elif url.path != '/admin':
-            self.page('Page unavailable', '<p>Choose a workshop from the dashboard.</p>', 404)
+                <button>Reserve points and submit request</button></form></section>''')
+        with closing(database()) as db:
+            claims = db.execute('SELECT reward AS name,points,date,status FROM claims WHERE user_id=? ORDER BY id DESC',
+                                (user_id,)).fetchall()
+            if path == '/claims':
+                return self.json([dict(row) for row in claims])
+            records = db.execute('''SELECT r.workshop,r.points,r.verified,r.created_at FROM registrations r
+                JOIN links l ON l.code=r.link_code WHERE l.user_id=? ORDER BY r.id DESC''', (user_id,)).fetchall()
+            activity = [dict(row) | {'workshop': workshop_name(row['workshop'])} for row in records]
+            earned, reserved = totals(db, user_id)
+            if path == '/api/points':
+                confirmed = sum(row['verified'] for row in records)
+                return self.json({'points': earned - reserved, 'confirmed': confirmed, 'pending': len(records) - confirmed})
+            links = db.execute('''SELECT l.code,l.recipient,l.workshop,l.opens,l.share_actions,
+                COUNT(r.id) AS registrations, COALESCE(SUM(r.points*r.verified),0) AS earned
+                FROM links l LEFT JOIN registrations r ON r.link_code=l.code
+                WHERE l.user_id=? GROUP BY l.code ORDER BY l.created_at DESC,l.rowid DESC''', (user_id,)).fetchall()
+            return self.json({'name': session['name'], 'activity': activity, 'claims': [dict(row) for row in claims],
+                              'links': [dict(row) for row in links], 'earned': earned, 'balance': earned - reserved})
+
+    def authenticate(self, path, field, password):
+        username = field('username').lower()
+        name = field('name')
+        signup = path == '/signup'
+        admin = path == '/admin/login'
+        if not 1 <= len(password) <= 256:
+            return self.auth_page(path, 'Check your password.', 400)
+        if not admin and not re.fullmatch(r'[a-z0-9_.-]{3,40}', username):
+            return self.auth_page(path, 'Enter a valid username.', 400)
+        if signup and (len(password) < 12 or not 1 <= len(name) <= 80):
+            return self.auth_page(path, 'Enter your name and use at least 12 characters for your password.', 400)
+
+        # Use a key independent of client-supplied forwarding headers.
+        rate_key = 'admin' if admin else ('signup' if signup else 'user:' + username)
+        limit = 30 if signup else 10
+        with closing(database()) as db, db:
+            db.execute('DELETE FROM login_attempts WHERE expires<=unixepoch()')
+            attempt = db.execute('''INSERT INTO login_attempts VALUES (?,1,unixepoch()+900)
+                ON CONFLICT(client) DO UPDATE SET attempts=attempts+1 WHERE attempts<?
+                RETURNING attempts''', (rate_key, limit)).fetchone()
+            if attempt is None:
+                return self.auth_page(path, 'Too many attempts. Try again in 15 minutes.', 429)
+            user = None if admin or signup else db.execute(
+                'SELECT * FROM users WHERE username=?', (username,)).fetchone()
+
+        if signup:
+            salt = secrets.token_hex(16)
+            password_hash = hash_password(password, salt)
+            try:
+                with closing(database()) as db, db:
+                    user_id = db.execute('INSERT INTO users(username,name,salt,password_hash) VALUES(?,?,?,?)',
+                                         (username, name, salt, password_hash)).lastrowid
+                    db.execute('INSERT INTO links(code,user_id) VALUES(?,?)', (secrets.token_urlsafe(12), user_id))
+            except sqlite3.IntegrityError:
+                return self.auth_page(path, 'That username is unavailable.', 409)
+            return self.start_session(user_id)
+        if admin:
+            valid = hmac.compare_digest(password.encode(), ADMIN.encode())
+        else:
+            computed = hash_password(password, user['salt'] if user else '00' * 16)
+            valid = user is not None and hmac.compare_digest(computed, user['password_hash'])
+        if not valid:
+            return self.auth_page(path, 'The login details did not match.', 401)
+        with closing(database()) as db, db:
+            db.execute('DELETE FROM login_attempts WHERE client=?', (rate_key,))
+        return self.start_session(user['id'] if user else None, admin)
 
     def do_POST(self):
-        origin = self.headers.get('Origin')
-        if origin != (PUBLIC_URL or 'http://' + self.headers.get('Host', '')):
-            self.send('Invalid origin', 403)
-            return
+        if self.headers.get('Origin') != (PUBLIC_URL or 'http://' + self.headers.get('Host', '')):
+            return self.send('Invalid origin', 403)
         size = self.headers.get('Content-Length', '')
         if not size.isdigit() or not 0 < int(size) <= 4096:
-            self.send('Invalid request body', 400)
-            return
+            return self.send('Invalid request body', 400)
         fields = parse_qs(self.rfile.read(int(size)).decode(errors='replace'))
+
         def field(key):
             return fields.get(key, [''])[0].strip()
-        if urlsplit(self.path).path == '/redeem':
-            if not self.authorized():
-                return
-            reward, nonce = field('reward'), field('nonce')
-            if reward not in REWARDS or not re.fullmatch('[a-f0-9]{32}', nonce):
-                return self.page('Invalid request', '', 400)
+
+        path = urlsplit(self.path).path
+        if path in ('/login', '/signup', '/admin/login'):
+            return self.authenticate(path, field, fields.get('password', [''])[0])
+        if path == '/logout':
             with closing(database()) as db, db:
-                db.execute('BEGIN IMMEDIATE')
-                earned = db.execute('SELECT COALESCE(SUM(points),0) FROM registrations WHERE referred=1 AND verified=1').fetchone()[0]
-                reserved = db.execute('SELECT COALESCE(SUM(points),0) FROM claims').fetchone()[0]
-                if not db.execute('SELECT 1 FROM claims WHERE nonce=?',(nonce,)).fetchone():
-                    if earned-reserved < REWARDS[reward]:
-                        return self.page('Insufficient Blessing Points', '<p>Your balance has changed.</p>', 409)
-                    db.execute('INSERT INTO claims(reward,points,nonce) VALUES(?,?,?)',(reward,REWARDS[reward],nonce))
-            return self.page('Reward requested', '<p>Your Blessing Points have been reserved.</p>')
-        if self.path == '/admin':
-            if not self.authorized():
-                return
+                db.execute('DELETE FROM sessions WHERE token_hash=?', (self.token_hash(),))
+            return self.redirect('/login', self.cookie('', 0))
+        if path.startswith('/w/') and path[3:] in WORKSHOPS:
+            return self.register(path[3:], field)
+
+        session = self.session()
+        if path == '/admin':
+            if not session or not session['is_admin']:
+                return self.redirect('/admin/login')
             with closing(database()) as db, db:
                 if field('claim'):
-                    db.execute("UPDATE claims SET status='Approved' WHERE id=? AND status='Pending approval'", (field('claim'),))
-                db.execute('UPDATE registrations SET verified=1 WHERE id=? AND verified=0', (field('id'),))
-            self.send_response(303)
-            self.send_header('Location', '/admin')
-            self.end_headers()
-            return
-        slug = self.path.removeprefix('/w/')
-        if not self.path.startswith('/w/') or slug not in WORKSHOPS:
-            self.page('Page unavailable', '', 404)
-            return
+                    db.execute("UPDATE claims SET status='Approved' WHERE id=? AND status='Pending approval'",
+                               (field('claim'),))
+                if field('id'):
+                    db.execute('UPDATE registrations SET verified=1 WHERE id=? AND verified=0', (field('id'),))
+            return self.redirect('/admin')
+        if path not in ('/api/links', '/api/share', '/redeem'):
+            return self.page('Page unavailable', '', 404)
+        if not session or not session['user_id']:
+            return self.json({'error': 'Member login required'}, 401) if path.startswith('/api/') else self.redirect('/login')
+        user_id = session['user_id']
+        if path == '/api/links':
+            workshop, recipient = field('workshop'), field('recipient')
+            if (workshop and workshop not in WORKSHOPS) or not 1 <= len(recipient) <= 80:
+                return self.json({'error': 'Enter a recipient label and choose a workshop.'}, 400)
+            code = secrets.token_urlsafe(12)
+            with closing(database()) as db, db:
+                db.execute('INSERT INTO links(code,user_id,workshop,recipient) VALUES(?,?,?,?)',
+                           (code, user_id, workshop, recipient))
+            return self.json({'code': code, 'workshop': workshop}, 201)
+        if path == '/api/share':
+            with closing(database()) as db, db:
+                changed = db.execute('UPDATE links SET share_actions=share_actions+1 WHERE code=? AND user_id=?',
+                                     (field('code'), user_id)).rowcount
+            return self.json({'ok': bool(changed)}, 200 if changed else 404)
+
+        reward, nonce = field('reward'), field('nonce')
+        if reward not in REWARDS or not re.fullmatch('[a-f0-9]{32}', nonce):
+            return self.page('Invalid request', '', 400)
+        with closing(database()) as db, db:
+            db.execute('BEGIN IMMEDIATE')
+            claim = db.execute('SELECT user_id,reward FROM claims WHERE nonce=?', (nonce,)).fetchone()
+            if claim and (claim['user_id'] != user_id or claim['reward'] != reward):
+                return self.page('Invalid request', '', 409)
+            if not claim:
+                earned, reserved = totals(db, user_id)
+                if earned - reserved < REWARDS[reward]:
+                    return self.page('Insufficient Blessing Points', '<p>Your balance has changed.</p>', 409)
+                db.execute('INSERT INTO claims(reward,points,nonce,user_id) VALUES(?,?,?,?)',
+                           (reward, REWARDS[reward], nonce, user_id))
+        return self.redirect('/?reward=requested')
+
+    def register(self, slug, field):
         name = field('name')
         phone = re.sub(r'[ ()-]', '', field('phone'))
+        code = field('ref')
         if not 1 <= len(name) <= 80 or not re.fullmatch(r'\+[1-9][0-9]{7,14}', phone):
-            self.page('Check your details', '<p>Enter your name and a mobile number with country code.</p>', 400)
-            return
+            return self.page('Check your details', '<p>Enter your name and a mobile number with country code.</p>', 400)
+        if code and not self.referral(code, slug):
+            return self.page('Referral link unavailable', '', 400)
         try:
             with closing(database()) as db, db:
-                db.execute('INSERT INTO registrations(workshop,name,phone,referred,points) VALUES(?,?,?,?,?)',
-                           (slug, name, phone, int(field('ref') == CODE), WORKSHOPS[slug][1]))
+                db.execute('''INSERT INTO registrations(workshop,name,phone,referred,points,link_code,created_at)
+                    VALUES(?,?,?,?,?,?,CURRENT_TIMESTAMP)''',
+                           (slug, name, phone, int(bool(code)), WORKSHOPS[slug][1],
+                            code if code and code != LEGACY_CODE else None))
         except sqlite3.IntegrityError:
-            self.page('Registration already received', '<p>Use the dashboard to explore other workshops.</p>', 409)
-            return
-        self.page('Registration received', '<p>Your registration is pending verification.</p>', 201)
+            return self.page('Registration already received', '<p>This mobile number already has a place reserved.</p>', 409)
+        return self.page('Registration received', '<p>Your registration is pending verification.</p>', 201)
+
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', '4174'))
     if HOST == '127.0.0.1' and 'CIRCLE_ADMIN_PASSWORD' not in os.environ:
-        print('Local admin: username admin, password ' + ADMIN, flush=True)
+        print('Local admin password: ' + ADMIN, flush=True)
     ThreadingHTTPServer((HOST, port), App).serve_forever()
