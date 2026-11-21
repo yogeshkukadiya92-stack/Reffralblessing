@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Referral admin · Circle</title>
+<style>
+:root {
+  color-scheme: light;
+  --canvas:#f3f5f1; --paper:#fff; --ink:#19352c; --muted:#51665d;
+  --line:#dbe5dc; --brand:#224c3e; --soft:#e8f1e8; --accent:#f7d9c4;
+  font: 16px/1.5 system-ui,sans-serif;
+}
+* { box-sizing:border-box; }
+body { margin:0; color:var(--ink); background:var(--canvas); }
+a { color:inherit; }
+:focus-visible { outline:3px solid #397f65; outline-offset:3px; }
+.wrap { width:min(1440px, calc(100% - 48px)); margin:auto; }
+header { background:var(--paper); border-bottom:1px solid var(--line); }
+header .wrap { display:flex; justify-content:space-between; align-items:center; min-height:68px; gap:12px; }
+.brand { display:inline-flex; align-items:center; gap:10px; font-size:22px; font-weight:800; text-decoration:none; }
+.brand::before { content:''; width:23px; height:23px; border:6px solid var(--brand); border-right-color:#d77f53; border-radius:50%; }
+button,.button { font:inherit; font-size:.875rem; font-weight:650; min-height:44px; border:1px solid transparent; border-radius:8px; padding:8px 14px; cursor:pointer; text-decoration:none; display:inline-flex; align-items:center; justify-content:center; }
+button { background:var(--brand); color:white; }
+button:hover { background:#173c30; }
+button.secondary { background:var(--paper); color:var(--ink); border-color:var(--line); }
+button.secondary:hover { background:var(--soft); }
+main { padding-block:28px 56px; }
+.intro { background:var(--brand); color:white; border-radius:18px; padding:clamp(20px,4vw,42px); }
+h1,h2,p { margin:0; }
+h1 { font-size:clamp(1.85rem,4vw,3rem); line-height:1.1; letter-spacing:-.055em; }
+.intro p { color:#e0eee6; margin-top:10px; }
+.metrics { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; margin:18px 0 25px; }
+.metric { padding:16px 18px; border:1px solid var(--line); background:var(--paper); border-radius:12px; }
+.metric dt { color:var(--muted); font-size:.875rem; font-weight:600; }
+.metric dd { margin:5px 0 0; font-size:clamp(1.45rem,3vw,2rem); font-weight:750; line-height:1.2; font-variant-numeric:tabular-nums; overflow-wrap:anywhere; }
+.nav { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:12px; }
+.nav a { background:transparent; color:var(--muted); }
+.nav a:hover { background:var(--paper); }
+.nav a[aria-current="page"] { background:var(--soft); border-color:#c2d8c8; color:var(--ink); }
+.panel { background:var(--paper); border:1px solid var(--line); border-radius:16px; min-width:0; }
+.panel-head { display:flex; flex-wrap:wrap; gap:16px; align-items:flex-start; justify-content:space-between; padding:20px; }
+h2 { font-size:1.25rem; letter-spacing:-.02em; }
+.hint { margin-top:4px; color:var(--muted); max-width:65ch; font-size:.875rem; }
+.search { display:grid; gap:4px; font-size:.875rem; font-weight:650; min-width:min(230px,100%); }
+input[type=search] { font:inherit; font-size:1rem; font-weight:400; min-height:44px; width:100%; border:1px solid #a7b9af; padding:8px 11px; border-radius:8px; }
+.table { overflow:auto; }
+table { width:100%; border-collapse:collapse; font-size:.875rem; font-variant-numeric:tabular-nums; }
+th,td { padding:12px 14px; text-align:left; border-top:1px solid var(--line); overflow-wrap:anywhere; }
+th { background:#f0f5ef; color:#35574a; font-size:.8rem; }
+tr:hover td { background:#f9fbf8; }
+td:first-child { font-weight:650; }
+.status { display:inline-block; background:var(--soft); color:#24573f; border-radius:20px; padding:3px 8px; white-space:nowrap; }
+.status.pending { background:#fff0dd; color:#794614; }
+.empty { margin:0 20px 20px; padding:24px 16px; border:1px dashed #bccdc1; border-radius:12px; background:#f8faf7; text-align:center; }
+.empty strong { display:block; margin-bottom:4px; }
+.empty p { color:var(--muted); font-size:.875rem; }
+[hidden] { display:none !important; }
+.notice { background:var(--soft); border:1px solid #c2d8c8; border-radius:8px; margin:0 0 12px; padding:10px 14px; }
+@media (max-width:720px) {
+  .wrap { width:calc(100% - 28px); }
+  main { padding-top:16px; }
+  .metrics { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .metric { padding:13px; }
+  .panel-head { padding:16px; }
+  .search { width:100%; }
+  .table { padding:0 12px 12px; }
+  table,tbody,tr,td { display:block; }
+  thead { position:absolute; width:1px; height:1px; overflow:hidden; clip-path:inset(50%); }
+  tr { border:1px solid var(--line); border-radius:10px; margin-bottom:8px; padding:8px 10px; }
+  td { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1.25fr); gap:9px; border:0; padding:5px 0; }
+  td::before { content:attr(data-label); color:var(--muted); font-weight:600; }
+  td form { justify-self:start; }
+}
+</style>
+<header><div class="wrap">
+  <a class="brand" href="/admin" aria-label="Circle admin home">circle</a>
+  <form method="post" action="/logout"><input type="hidden" name="logout" value="1"><button class="secondary">Log out</button></form>
+</div></header>
+<main class="wrap">
+  <div class="intro"><h1>Referral admin</h1><p>Manage referrals, verify registrations and approve rewards.</p></div>
+  <dl class="metrics">$metrics</dl>
+  <nav class="nav" aria-label="Admin reports">$nav</nav>
+  $notice
+  $panel
+</main>
+<script>
+const search = document.querySelector('#report-search');
+if (search) {
+  const rows = [...document.querySelectorAll('tbody tr')];
+  const noResults = document.querySelector('#no-results');
+  search.addEventListener('input', () => {
+    const query = search.value.trim().toLowerCase();
+    let shown = 0;
+    for (const row of rows) {
+      row.hidden = !row.textContent.toLowerCase().includes(query);
+      if (!row.hidden) shown++;
+    }
+    noResults.hidden = shown !== 0;
+  });
+}
+</script>
+</html>

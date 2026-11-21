@@ -10,6 +10,7 @@ from contextlib import closing
 from http.cookies import SimpleCookie, CookieError
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from string import Template
 from urllib.parse import parse_qs, urlsplit
 
 ROOT = Path(__file__).resolve().parent
@@ -90,10 +91,17 @@ def totals(db, user_id):
     return earned, reserved
 
 
-def table(headers, rows):
-    columns = ''.join(f'<th scope="col">{escape(header)}</th>' for header in headers)
-    body = ''.join('<tr>' + ''.join(f'<td>{cell}</td>' for cell in row) + '</tr>' for row in rows)
-    return f'<div class="table"><table><thead><tr>{columns}</tr></thead><tbody>{body}</tbody></table></div>'
+def table(title, headers, rows):
+    columns = ''.join(f'<th scope="col" role="columnheader">{escape(label)}</th>' for label in headers)
+    body = ''.join(
+        '<tr role="row">' + ''.join(
+            f'<td role="cell" data-label="{escape(label)}">{cell}</td>'
+            for label, cell in zip(headers, row, strict=True)
+        ) + '</tr>' for row in rows
+    )
+    return (f'<div class="table" role="region" aria-label="{escape(title)} table" tabindex="0">'
+            f'<table role="table" aria-label="{escape(title)}"><thead role="rowgroup">'
+            f'<tr role="row">{columns}</tr></thead><tbody role="rowgroup">{body}</tbody></table></div>')
 
 
 class App(BaseHTTPRequestHandler):
@@ -217,32 +225,69 @@ class App(BaseHTTPRequestHandler):
         def action(field, value, label):
             return f'<form method="post" action="/admin"><input type="hidden" name="{field}" value="{value}"><button>{label}</button></form>'
 
-        members = table(('Username', 'Member', 'Links', 'Share actions', 'Opens', 'Registrations', 'Earned', 'Available'),
+        def status(label, pending):
+            return f'<span class="status{" pending" if pending else ""}">{escape(label)}</span>'
+
+        members = table('Members', ('Username', 'Member', 'Links', 'Share actions', 'Opens', 'Registrations', 'Earned', 'Available'),
                         (cells(r['username'], r['name'], r['links'], r['shares'], r['opens'], r['registrations'],
                                r['earned'], r['earned'] - r['reserved']) for r in users))
-        shares = table(('Owner', 'Recipient label', 'Link code', 'Workshop', 'Share actions', 'Opens', 'Registrations', 'Verified', 'Earned'),
+        shares = table('Referral links', ('Owner', 'Recipient label', 'Link code', 'Workshop', 'Share actions', 'Opens', 'Registrations', 'Verified', 'Earned'),
                        (cells(r['username'], r['recipient'] or '—', r['code'], workshop_name(r['workshop']) or 'All',
                               r['share_actions'], r['opens'], r['registrations'], r['confirmed'], r['earned']) for r in links))
-        records = table(('Participant', 'Mobile', 'Workshop', 'Registered at (UTC)', 'Referred by', 'Recipient label', 'Link code', 'Status', 'Points earned', 'Action'),
+        records = table('Registrations', ('Participant', 'Mobile', 'Workshop', 'Registered at (UTC)', 'Referred by', 'Recipient label', 'Link code', 'Status', 'Points earned', 'Action'),
                         (cells(r['name'], r['phone'], workshop_name(r['workshop']), r['created_at'] or '—',
                                r['username'] or ('Legacy referral' if r['referred'] else 'Direct'),
                                r['recipient'] or '—', r['link_code'] or ('YOGESH24' if r['referred'] else '—'),
-                               'Verified' if r['verified'] else 'Pending',
-                               r['points'] if r['verified'] and r['referred'] else 0) +
+                               ) + (status('Verified' if r['verified'] else 'Pending', not r['verified']),
+                                    str(r['points'] if r['verified'] and r['referred'] else 0)) +
                          ('—' if r['verified'] else action('id', r['id'], 'Verify'),) for r in registrations))
-        rewards = table(('Member', 'Reward', 'Points', 'Date', 'Status', 'Action'),
-                        (cells(r['username'] or 'Legacy', r['reward'], r['points'], r['date'], r['status']) +
+        rewards = table('Reward requests', ('Member', 'Reward', 'Points', 'Date', 'Status', 'Action'),
+                        (cells(r['username'] or 'Legacy', r['reward'], r['points'], r['date']) +
+                         (status(r['status'], r['status'] == 'Pending approval'),) +
                          ((action('claim', r['id'], 'Approve') if r['status'] == 'Pending approval' else '—'),)
                          for r in claims))
-        self.page('Referral admin', f'''<div class="links"><a href="#members">Members</a><a href="#shares">Referral links</a>
-            <a href="#registrations">Registrations</a><a href="#rewards">Rewards</a>
-            <form method="post" action="/logout"><input type="hidden" name="logout" value="1"><button>Log out</button></form></div>
-            <section id="members"><h2>Members · {len(users)}</h2>{members}</section>
-            <section id="shares"><h2>Referral links · {len(links)}</h2>
-            <p>Recipient labels are entered by members. Share actions count copy and WhatsApp clicks.
-            Opens count workshop or invitation page visits and may include repeat visits.</p>{shares}</section>
-            <section id="registrations"><h2>Registrations · {len(registrations)}</h2>{records}</section>
-            <section id="rewards"><h2>Reward requests · {len(claims)}</h2>{rewards}</section>''')
+        reports = {
+            'registrations': ('Registrations', registrations, records,
+                              'Workshop sign-ups will appear here for verification.'),
+            'members': ('Members', users, members,
+                        'Members will appear after creating a Circle account.'),
+            'shares': ('Referral links', links, shares,
+                       'Links will appear when members join or create an invite.'),
+            'rewards': ('Reward requests', claims, rewards,
+                        'Requests will appear when members redeem their points.'),
+        }
+        query = parse_qs(urlsplit(self.path).query)
+        current = query.get('view', ['registrations'])[0]
+        if current not in reports:
+            current = 'registrations'
+        title, rows, report, empty_message = reports[current]
+        links_hint = ('<p class="hint">Shares count copy and WhatsApp clicks. Opens may include repeat visits.</p>'
+                      if current == 'shares' else '')
+        search = ('<label class="search" for="report-search">Search this report'
+                  '<input type="search" id="report-search" placeholder="Search rows"></label>') if rows else ''
+        content = (report + '<div class="empty" id="no-results" role="status" hidden>No matching rows.</div>'
+                   if rows else f'<div class="empty"><strong>No {title.lower()} yet</strong><p>{empty_message}</p></div>')
+        panel = (f'<section class="panel" aria-labelledby="report-title"><div class="panel-head">'
+                 f'<div><h2 id="report-title">{title}</h2>{links_hint}</div>{search}</div>{content}</section>')
+        nav = ''.join(
+            f'<a class="button" href="/admin?view={key}"'
+            f'{" aria-current=page" if key == current else ""}>{item[0]}</a>'
+            for key, item in reports.items()
+        )
+        metrics = ''.join(
+            f'<div class="metric"><dt>{title}</dt><dd>{value:,}</dd></div>'
+            for title, value in (
+                ('Members', len(users)),
+                ('Referral links', len(links)),
+                ('Pending registrations', sum(not r['verified'] for r in registrations)),
+                ('Blessing Points awarded', sum(r['points'] for r in registrations if r['verified'] and r['referred'])),
+            )
+        )
+        feedback = {'verified': 'Registration verified.', 'approved': 'Reward request approved.'}
+        message = feedback.get(query.get('result', [''])[0])
+        notice = f'<p class="notice" role="status">{message}</p>' if message else ''
+        self.send(Template((ROOT / 'admin.html').read_text()).substitute(
+            metrics=metrics, nav=nav, notice=notice, panel=panel))
 
     def do_GET(self):
         url = urlsplit(self.path)
@@ -381,11 +426,14 @@ class App(BaseHTTPRequestHandler):
                 return self.redirect('/admin/login')
             with closing(database()) as db, db:
                 if field('claim'):
-                    db.execute("UPDATE claims SET status='Approved' WHERE id=? AND status='Pending approval'",
-                               (field('claim'),))
-                if field('id'):
-                    db.execute('UPDATE registrations SET verified=1 WHERE id=? AND verified=0', (field('id'),))
-            return self.redirect('/admin')
+                    changed = db.execute("UPDATE claims SET status='Approved' WHERE id=? AND status='Pending approval'",
+                                         (field('claim'),)).rowcount
+                    return_path = '/admin?view=rewards' + ('&result=approved' if changed else '')
+                else:
+                    changed = db.execute('UPDATE registrations SET verified=1 WHERE id=? AND verified=0',
+                                         (field('id'),)).rowcount
+                    return_path = '/admin?view=registrations' + ('&result=verified' if changed else '')
+            return self.redirect(return_path)
         if path not in ('/api/links', '/api/share', '/redeem'):
             return self.page('Page unavailable', '', 404)
         if not session or not session['user_id']:
